@@ -23,9 +23,9 @@ import websocket
 def create_session(proxy_url, session_id):
     # type: (str, str) -> bool
     """Создаёт сессию логирования на прокси."""
-    url = "{}/logging_session".format(proxy_url)
+    url = "{}/logging_session/{}".format(proxy_url, session_id)
     try:
-        resp = requests.post(url, json={"session_id": session_id}, timeout=10)
+        resp = requests.post(url, timeout=10)
         if resp.status_code == 200:
             print("[CLIENT-READER] Сессия '{}' создана".format(session_id), file=sys.stderr)
             return True

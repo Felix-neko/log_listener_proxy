@@ -14,14 +14,8 @@ import time
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
-
-
-class CreateSessionRequest(BaseModel):
-    """Запрос на создание сессии логирования."""
-
-    session_id: str = Field(..., description="Уникальный идентификатор сессии")
 
 
 class SessionResponse(BaseModel):
@@ -81,10 +75,15 @@ app = FastAPI(
 )
 
 
-@app.post("/logging_session", response_model=SessionResponse)
-async def create_logging_session(request: CreateSessionRequest = Body(...)) -> SessionResponse:
+@app.get("/health")
+async def health():
+    """Проверка работоспособности сервиса."""
+    return {"name": "log_listener_proxy", "status": "ok"}
+
+
+@app.post("/logging_session/{session_id}", response_model=SessionResponse)
+async def create_logging_session(session_id: str) -> SessionResponse:
     """Создать новую сессию логирования."""
-    session_id = request.session_id
     if session_id in sessions:
         raise HTTPException(status_code=400, detail=f"Сессия '{session_id}' уже существует")
     sessions[session_id] = LoggingSession(session_id)
