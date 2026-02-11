@@ -8,7 +8,7 @@
 
 ## Сценарий использования
 
-1. **Клиентское приложение** создаёт сессию логирования через `POST /logging_session`
+1. **Клиентское приложение** создаёт сессию логирования через `POST /logging_session/{session_id}`
 2. **Клиент** подключается к WebSocket-эндпоинтам `/logs/{session_id}/read/stdout` и `/logs/{session_id}/read/stderr`
 3. **PySpark-приложение** на удалённом Spark-драйвере подключается к `/logs/{session_id}/write/stdout` и `/logs/{session_id}/write/stderr`
 4. Данные от PySpark проксируются в реальном времени к клиенту
@@ -28,28 +28,61 @@ uv sync --all-extras
 ## Запуск сервера
 
 ```bash
-# Запуск на 0.0.0.0:8160 с TTL=3600 секунд (по умолчанию)
+# Запуск с настройками по умолчанию (0.0.0.0:8160, TTL=3600 секунд)
 uv run python -m log_listener_proxy.server
 
-# Или через uvicorn с кастомными параметрами
+# Или через uvicorn напрямую (без ServerSettings и порт-менеджера)
 uv run uvicorn log_listener_proxy.server:app --host 0.0.0.0 --port 8160
 ```
 
-### Параметры запуска
+### Конфигурация через ServerSettings
 
-Функция `main(host, port, ttl)` в `server.py` принимает следующие параметры:
-- `host` (str): хост для прослушивания (по умолчанию `"0.0.0.0"`)
-- `port` (int): порт для прослушивания (по умолчанию `8160`)
-- `ttl` (int): время жизни сессии в секундах (по умолчанию `3600` = 1 час)
+Все настройки сервера задаются через Pydantic-класс `ServerSettings`, который поддерживает
+переменные среды с префиксом `LOG_LISTENER_`.
+
+| Параметр           | Тип   | По умолчанию                                     | Переменная среды                 | Описание                                                         |
+|--------------------|-------|--------------------------------------------------|----------------------------------|------------------------------------------------------------------|
+| `host`             | str   | `"0.0.0.0"`                                      | `LOG_LISTENER_HOST`              | Хост для прослушивания                                           |
+| `port`             | int   | `8160`                                            | `LOG_LISTENER_PORT`              | Порт для прослушивания (игнорируется при `use_port_manager=True`) |
+| `ttl`              | int   | `3600`                                            | `LOG_LISTENER_TTL`               | Время жизни сессии в секундах (1 час по умолчанию)               |
+| `use_port_manager` | bool  | `False`                                           | `LOG_LISTENER_USE_PORT_MANAGER`  | Запрашивать порт у порт-менеджера вместо фиксированного          |
+| `port_manager_url` | str   | `"http://portmanager.airflow-fs.svc/manage"`      | `LOG_LISTENER_PORT_MANAGER_URL`  | URL порт-менеджера                                               |
+
+**Примеры запуска:**
+
+```bash
+# Через переменные среды
+LOG_LISTENER_PORT=9000 LOG_LISTENER_TTL=7200 uv run python -m log_listener_proxy.server
+
+# С порт-менеджером в Kubernetes
+LOG_LISTENER_USE_PORT_MANAGER=true uv run python -m log_listener_proxy.server
+```
+
+При запуске через `if __name__ == "__main__"` настройки читаются автоматически:
+
+```python
+settings = ServerSettings()
+main(**settings.model_dump())
+```
+
+### Интеграция с порт-менеджером
+
+Если `use_port_manager=True`, сервер:
+1. Запрашивает свободный порт через `GET {port_manager_url}/v2?portcount=1&name={pod_name}`
+2. Запускает uvicorn на полученном порту
+3. При завершении освобождает порт через `DELETE {port_manager_url}/v2?portcount=1&name={pod_name}`
+
+Имя пода берётся из переменной среды `POD_NAME` (Kubernetes downward API) или из `socket.gethostname()`.
 
 ## API-эндпоинты
 
 ### HTTP
 
-| Метод | Эндпоинт | Описание | Request Body | Response |
-|-------|----------|----------|--------------|----------|
-| POST | `/logging_session` | Создать сессию логирования | `{"session_id": "string"}` | `SessionResponse` |
-| DELETE | `/logging_session/{session_id}` | Удалить сессию логирования | - | `SessionResponse` |
+| Метод  | Эндпоинт                        | Описание                    | Request Body | Response          |
+|--------|----------------------------------|-----------------------------|--------------|-------------------|
+| GET    | `/health`                        | Проверка работоспособности  | —            | `{"name": "...", "status": "ok"}` |
+| POST   | `/logging_session/{session_id}`  | Создать сессию логирования  | —            | `SessionResponse` |
+| DELETE | `/logging_session/{session_id}`  | Удалить сессию логирования  | —            | `SessionResponse` |
 
 **SessionResponse** (Pydantic DTO):
 ```json
@@ -129,32 +162,32 @@ log_listener_proxy/
 Основной файл микросервиса. Содержит:
 
 **Pydantic модели:**
-- `CreateSessionRequest` — запрос на создание сессии
+- `ServerSettings(BaseSettings)` — конфигурация сервера с поддержкой env-переменных (префикс `LOG_LISTENER_`)
 - `SessionResponse` — ответ при создании/удалении сессии
 - `LoggingSession` — класс сессии логирования с очередями для stdout/stderr
 
 **Глобальные переменные:**
 - `sessions: dict[str, LoggingSession]` — хранилище активных сессий
-- `session_ttl: int` — время жизни сессии в секундах (настраивается через `main(ttl=...)`)
-- `cleanup_task_running: bool` — флаг для остановки фоновой задачи
+- `session_ttl: int` — время жизни сессии в секундах (настраивается через `ServerSettings.ttl`)
 
-**Фоновые задачи:**
-- `cleanup_expired_sessions_loop()` — асинхронная задача, которая каждые 10 секунд проверяет и удаляет истёкшие сессии
+**Вспомогательные функции:**
+- `_schedule_session_deletion()` — отложенное удаление сессии через `asyncio.sleep`
+- `_port_manager_context()` — контекст-менеджер для получения/освобождения порта через порт-менеджер
 
-**HTTP эндпоинты:**
-- `POST /logging_session` — создание новой сессии логирования
+**HTTP-эндпоинты:**
+- `GET /health` — проверка работоспособности сервиса
+- `POST /logging_session/{session_id}` — создание новой сессии логирования
 - `DELETE /logging_session/{session_id}` — удаление сессии
 
-**WebSocket эндпоинты:**
+**WebSocket-эндпоинты:**
 - `/logs/{session_id}/read/{output_type}` — чтение логов клиентом (может быть несколько reader-ов)
 - `/logs/{session_id}/write/{output_type}` — запись логов от PySpark (только один writer на output_type)
 
 **Логика работы:**
-1. При старте приложения запускается фоновая задача `cleanup_expired_sessions_loop()` через `asyncio.create_task()`
-2. Каждые 10 секунд задача проверяет все сессии и удаляет те, у которых `current_time - created_at > session_ttl`
-3. При подключении к WebSocket обновляется `last_activity` сессии
-4. При получении/отправке данных через WebSocket также обновляется `last_activity`
-5. При закрытии write-соединения в очередь отправляется `None`, что сигнализирует reader-ам о необходимости закрыться через 5 секунд
+1. При создании сессии запускается отложенная задача `_schedule_session_deletion()` через `asyncio.create_task()`
+2. Задача ждёт `session_ttl` секунд и удаляет сессию
+3. При закрытии write-соединения в очередь отправляется `None`, что сигнализирует reader-ам о необходимости закрыться через 5 секунд
+4. Если `use_port_manager=True`, порт запрашивается у порт-менеджера при старте и освобождается при завершении
 
 ### `examples/client_reader.py`
 
@@ -171,13 +204,6 @@ log_listener_proxy/
 - Перенаправляет полученные данные в `sys.stdout` или `sys.stderr`
 - Отслеживает состояние подключения (`connected`, `closed`)
 
-**Функция main():**
-- Принимает параметры: `session_id`, `proxy_url`, `skip_create_session`
-- Создаёт сессию (если `skip_create_session=False`)
-- Подключается к stdout и stderr WebSocket-ам
-- Ждёт закрытия обоих соединений
-- Удаляет сессию при завершении
-
 ### `examples/pyspark_writer.py`
 
 Скрипт для PySpark-приложений, отправляющий логи на прокси. Совместим с Python 3.7+.
@@ -187,13 +213,6 @@ log_listener_proxy/
 - Подключается к WebSocket при инициализации
 - Метод `write()` отправляет данные в оригинальный поток и в WebSocket
 - Использует блокировку (`threading.Lock`) для потокобезопасности
-
-**Функция main():**
-- Принимает параметры: `session_id`, `proxy_url`
-- Создаёт обёртки для `sys.stdout` и `sys.stderr`
-- Подменяет стандартные потоки на обёртки
-- Имитирует работу PySpark-приложения (в реальном использовании здесь будет ваш код)
-- Восстанавливает оригинальные потоки и закрывает WebSocket-соединения
 
 ### `tests/test_integration.py`
 
@@ -214,18 +233,25 @@ log_listener_proxy/
 
 - **Сервер**: Python 3.12+
 - **Клиентские скрипты** (`examples/`): Python 3.7+
-- **Зависимости сервера**: FastAPI, uvicorn, websockets, pydantic
+- **Зависимости сервера**: FastAPI, uvicorn, websockets, pydantic, pydantic-settings, requests
 - **Зависимости клиентов**: requests, websocket-client
 
 ## Особенности реализации
 
 ### Автоочистка сессий
 
-Сессии автоматически удаляются по истечении времени жизни. Это реализовано через:
-- Фоновую асинхронную задачу `cleanup_expired_sessions_loop()`
-- Запуск через `asyncio.create_task()` в `lifespan` контекстном менеджере
-- Проверка каждые 10 секунд
-- Сравнение `current_time - session.created_at > session_ttl`
+Сессии автоматически удаляются по истечении TTL. Это реализовано через:
+- Отложенную асинхронную задачу `_schedule_session_deletion()` для каждой сессии
+- Запуск через `asyncio.create_task()` при создании сессии
+- Удаление сессии через `session_ttl` секунд после создания
+
+### Порт-менеджер
+
+При развёртывании в Kubernetes можно использовать порт-менеджер для динамического выделения портов:
+- Включается через `LOG_LISTENER_USE_PORT_MANAGER=true`
+- Порт запрашивается через `GET /v2?portcount=1&name={pod_name}`
+- Порт освобождается через `DELETE /v2?portcount=1&name={pod_name}` при завершении
+- Имя пода определяется из `POD_NAME` (Kubernetes downward API) или `socket.gethostname()`
 
 ### Многопоточность и безопасность
 

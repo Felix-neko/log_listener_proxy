@@ -10,12 +10,41 @@
 """
 
 import asyncio
+import os
+import socket
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Literal
+from urllib.parse import urljoin
 
+import requests as http_requests
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ServerSettings(BaseSettings):
+    """Настройки сервера log_listener_proxy.
+
+    Значения можно задавать через переменные среды с префиксом LOG_LISTENER_.
+    Например: LOG_LISTENER_PORT=9000, LOG_LISTENER_USE_PORT_MANAGER=true.
+    """
+
+    model_config = SettingsConfigDict(
+        # Префикс для переменных среды: LOG_LISTENER_HOST, LOG_LISTENER_PORT, ...
+        env_prefix="LOG_LISTENER_",
+    )
+
+    # Хост для прослушивания
+    host: str = "0.0.0.0"
+    # Порт для прослушивания (игнорируется, если use_port_manager=True)
+    port: int = 8160
+    # Время жизни сессии логирования в секундах (по умолчанию 1 час)
+    ttl: int = 3600
+    # Если True, порт запрашивается у порт-менеджера вместо использования фиксированного значения
+    use_port_manager: bool = False
+    # URL порт-менеджера для получения/освобождения портов
+    port_manager_url: str = "http://portmanager.airflow-fs.svc/manage"
 
 
 class SessionResponse(BaseModel):
@@ -189,21 +218,70 @@ async def write_logs(websocket: WebSocket, session_id: str, output_type: Literal
         await queue.put(None)
 
 
-def main(host="0.0.0.0", port=8160, ttl=3600):
+@contextmanager
+def _port_manager_context(port_manager_url: str):
+    """Контекст-менеджер для получения и освобождения порта через порт-менеджер.
+
+    При входе в контекст запрашивает свободный порт через GET-запрос к порт-менеджеру.
+    При выходе из контекста освобождает порт через DELETE-запрос.
+
+    Args:
+        port_manager_url: базовый URL порт-менеджера (например, "http://portmanager.airflow-fs.svc/manage")
+
+    Yields:
+        int: номер порта, выделенного порт-менеджером
+    """
+    # Имя пода берём из переменной среды POD_NAME (Kubernetes downward API)
+    # или из hostname, если переменная не задана
+    pod_name = os.environ.get("POD_NAME", socket.gethostname())
+    params = {"portcount": 1, "name": pod_name}
+
+    print(f"[PORT-MANAGER] Запрашиваем порт: url={port_manager_url}, pod={pod_name}")
+    resp = http_requests.get(url=urljoin(port_manager_url, "v2"), params=params)
+    resp.raise_for_status()
+    port = resp.json()["ports"][0]
+    print(f"[PORT-MANAGER] Получен порт: {port}")
+
+    try:
+        yield port
+    finally:
+        print(f"[PORT-MANAGER] Освобождаем порт: pod={pod_name}")
+        try:
+            http_requests.delete(url=urljoin(port_manager_url, "v2"), params=params)
+            print(f"[PORT-MANAGER] Порт {port} освобождён")
+        except Exception as e:
+            print(f"[PORT-MANAGER] Ошибка при освобождении порта: {e}")
+
+
+def main(
+    host: str = "0.0.0.0",
+    port: int = 8160,
+    ttl: int = 3600,
+    use_port_manager: bool = False,
+    port_manager_url: str = "http://portmanager.airflow-fs.svc/manage",
+):
     """Точка входа для запуска сервера.
-    
+
     Args:
         host: хост для прослушивания
-        port: порт для прослушивания
+        port: порт для прослушивания (игнорируется, если use_port_manager=True)
         ttl: время жизни сессии в секундах (по умолчанию 3600 = 1 час)
+        use_port_manager: если True, порт запрашивается у порт-менеджера
+        port_manager_url: URL порт-менеджера для получения/освобождения портов
     """
     import uvicorn
 
     global session_ttl
     session_ttl = ttl
 
-    uvicorn.run(app, host=host, port=port)
+    if use_port_manager:
+        # Порт запрашивается у порт-менеджера и освобождается при завершении
+        with _port_manager_context(port_manager_url) as managed_port:
+            uvicorn.run(app, host=host, port=managed_port)
+    else:
+        uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
-    main()
+    settings = ServerSettings()
+    main(**settings.model_dump())

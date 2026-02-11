@@ -76,7 +76,7 @@ def test_log_proxy_integration(server_process):
     import requests
 
     # 1. Создаём сессию логирования
-    resp = requests.post(f"{PROXY_URL}/logging_session", json={"session_id": SESSION_ID})
+    resp = requests.post(f"{PROXY_URL}/logging_session/{SESSION_ID}")
     assert resp.status_code == 200, f"Не удалось создать сессию: {resp.text}"
 
     try:
@@ -154,11 +154,11 @@ def test_session_lifecycle(server_process):
     test_session = "lifecycle-test-session"
 
     # Создаём сессию
-    resp = requests.post(f"{PROXY_URL}/logging_session", json={"session_id": test_session})
+    resp = requests.post(f"{PROXY_URL}/logging_session/{test_session}")
     assert resp.status_code == 200
 
     # Повторное создание должно вернуть ошибку
-    resp = requests.post(f"{PROXY_URL}/logging_session", json={"session_id": test_session})
+    resp = requests.post(f"{PROXY_URL}/logging_session/{test_session}")
     assert resp.status_code == 400
 
     # Удаляем сессию
@@ -195,11 +195,11 @@ def test_session_auto_cleanup():
         test_session = "auto-cleanup-test-session"
 
         # Создаём сессию
-        resp = requests.post(f"{test_url}/logging_session", json={"session_id": test_session})
+        resp = requests.post(f"{test_url}/logging_session/{test_session}")
         assert resp.status_code == 200, f"Не удалось создать сессию: {resp.text}"
 
         # Проверяем, что сессия существует (пытаемся создать дубликат)
-        resp = requests.post(f"{test_url}/logging_session", json={"session_id": test_session})
+        resp = requests.post(f"{test_url}/logging_session/{test_session}")
         assert resp.status_code == 400, "Сессия должна существовать"
 
         # Ждём 25 секунд (10 секунд TTL + 10 секунд на срабатывание задачи очистки + 5 секунд запас)
